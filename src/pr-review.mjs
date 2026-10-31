@@ -4,10 +4,25 @@ import {compare,shouldFail} from './diff.mjs';
 const shaPattern=/^[a-f0-9]{40}$/;
 const supported=path=>/(^|\/)\.claude\/settings(?:\.local)?\.json$/.test(path)?'claude-settings':/(^|\/)(\.mcp\.json|\.cursor\/mcp\.json)$/.test(path)?'mcp':null;
 const unsupported=path=>/(^|\/)(\.codex\/config\.toml|\.vscode\/mcp\.json|\.claude\/settings(?:\.local)?\.jsonc)$/.test(path);
-function git(cwd,args,maxBuffer=4000000){
+function gitBytes(cwd,args,maxBuffer=4000000){
  const r=spawnSync('git',['--no-pager','--literal-pathspecs',...args],{cwd,encoding:null,timeout:20000,maxBuffer,env:{...process.env,GIT_OPTIONAL_LOCKS:'0',GIT_TERMINAL_PROMPT:'0'}});
  if(r.status!==0||r.error)throw Error('Git objects unavailable or repository limit exceeded. Fetch full PR history and retry.');
- return new TextDecoder('utf-8',{fatal:true}).decode(r.stdout);
+ return r.stdout;
+}
+function git(cwd,args,maxBuffer=4000000){
+ return new TextDecoder('utf-8',{fatal:true}).decode(gitBytes(cwd,args,maxBuffer));
+}
+// Changed paths are opaque identifiers that are only pattern-matched before
+// any read. Decode each name on its own: a name that is not valid UTF-8 must
+// not abort the whole review, but it is only ever matched, never read back,
+// because its exact bytes cannot round-trip through a JavaScript string.
+function changedPaths(cwd,mergeBase,head){
+ const raw=gitBytes(cwd,['diff','--no-ext-diff','--no-textconv','--no-renames','--name-only','-z',mergeBase,head,'--']);
+ const decoder=new TextDecoder('utf-8',{fatal:true});
+ return raw.toString('latin1').split('\0').filter(Boolean).map(chunk=>{
+  const bytes=Buffer.from(chunk,'latin1');
+  try{return {path:decoder.decode(bytes),exact:true};}catch{return {path:chunk,exact:false};}
+ });
 }
 function blob(cwd,revision,path){
  const entry=git(cwd,['ls-tree','-z',revision,'--',path]).split('\0').filter(Boolean);
@@ -25,12 +40,13 @@ export function reviewPR({cwd,base,head,repository,threshold='medium'}){
  const bases=git(cwd,['merge-base','--all',base,head]).trim().split(/\s+/);
  if(bases.length!==1||!shaPattern.test(bases[0]))throw Error('PR does not have one unambiguous merge base.');
  const mergeBase=bases[0];
- const changed=git(cwd,['diff','--no-ext-diff','--no-textconv','--no-renames','--name-only','-z',mergeBase,head,'--']).split('\0').filter(Boolean);
- const paths=changed.filter(p=>supported(p)||unsupported(p));
+ const changed=changedPaths(cwd,mergeBase,head);
+ const paths=changed.filter(({path})=>supported(path)||unsupported(path));
  if(paths.length>100)throw Error('More than 100 configuration files changed; split the review.');
- const files=paths.map(path=>{
+ const files=paths.map(({path,exact})=>{
   const format=supported(path);
   if(!format)return {path,status:'unsupported',reason:'Recognized configuration format is not supported. Review this file manually.'};
+  if(!exact)return {path,status:'error',reason:'Configuration path is not valid UTF-8 and cannot be read exactly. Review manually; no clean result is claimed.'};
   try{
    const before=blob(cwd,mergeBase,path),after=blob(cwd,head,path);
    const empty=format==='mcp'?' {"mcpServers":{}} ':'{}';
