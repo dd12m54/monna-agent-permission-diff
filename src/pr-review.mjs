@@ -45,13 +45,13 @@ export function reviewPR({cwd,base,head,repository,threshold='medium'}){
  if(paths.length>100)throw Error('More than 100 configuration files changed; split the review.');
  const files=paths.map(({path,exact})=>{
   const format=supported(path);
-  if(!format)return {path,status:'unsupported',reason:'Recognized configuration format is not supported. Review this file manually.'};
-  if(!exact)return {path,status:'error',reason:'Configuration path is not valid UTF-8 and cannot be read exactly. Review manually; no clean result is claimed.'};
+  if(!format)return {path,exact,status:'unsupported',reason:'Recognized configuration format is not supported. Review this file manually.'};
+  if(!exact)return {path,exact,status:'error',reason:'Configuration path is not valid UTF-8 and cannot be read exactly. Review manually; no clean result is claimed.'};
   try{
    const before=blob(cwd,mergeBase,path),after=blob(cwd,head,path);
    const empty=format==='mcp'?' {"mcpServers":{}} ':'{}';
-   return {path,status:'compared',beforePresent:before!==null,afterPresent:after!==null,report:compare(before??empty,after??empty,{format})};
-  }catch{return {path,status:'error',reason:'Configuration could not be compared: invalid JSON, unsupported Git entry, unavailable object or input limit. Review manually; no clean result is claimed.'};}
+   return {path,exact,status:'compared',beforePresent:before!==null,afterPresent:after!==null,report:compare(before??empty,after??empty,{format})};
+  }catch{return {path,exact,status:'error',reason:'Configuration could not be compared: invalid JSON, unsupported Git entry, unavailable object or input limit. Review manually; no clean result is claimed.'};}
  });
  const incomplete=files.some(f=>f.status!=='compared');
  const fail=files.some(f=>f.report&&shouldFail(f.report,threshold));
@@ -79,21 +79,24 @@ const reduction=['ALLOW_REMOVED','DENY_ADDED','ASK_ADDED','DIRECTORY_REMOVED','S
 export function advice(code){return actions[code]??(reduction.includes(code)?['This is a potentially more restrictive declared configuration.','Confirm required workflows still work; other configuration layers may override this change.']:['A declared configuration field changed.','Inspect the source and confirm the change is intentional.']);}
 export function prMarkdown(result){
  const encode=part=>encodeURIComponent(part).replace(/[!'()*]/g,c=>'%'+c.charCodeAt(0).toString(16).toUpperCase());
- const url=(sha,path,line)=>`https://github.com/${result.repository}/blob/${sha}/${path.split('/').map(encode).join('/')}#L${line}`;
+ // A non-exact path is a latin1 string whose code units are the raw filename
+ // bytes; percent-encode those bytes themselves, not their UTF-8 form.
+ const encodeRaw=part=>[...part].map(c=>c.charCodeAt(0)<128?encode(c):'%'+c.charCodeAt(0).toString(16).toUpperCase().padStart(2,'0')).join('');
+ const url=(sha,path,line,exact=true)=>`https://github.com/${result.repository}/blob/${sha}/${path.split('/').map(exact?encode:encodeRaw).join('/')}#L${line}`;
  const lines=['# MONNA — Agent permission PR review','',`**${result.verdict}** · ${result.files.length} configuration files · ${result.findings} findings`,
  '',`Compared merge base \`${result.mergeBase}\` to PR head \`${result.head}\`.`,
  '',`Gate threshold: ${result.threshold}. This gate does not establish runtime safety.`,
  '', 'Configuration values are omitted. Source links intentionally identify repository files and lines.'];
  if(!result.files.length)lines.push('','No recognized configuration changes found. Other agent configurations and runtime behavior were not assessed.');
  result.files.forEach((file,i)=>{
-  lines.push('',`## File ${i+1}`,`[Source file](${url(file.afterPresent===false?result.mergeBase:result.head,file.path,1)})`);
+  lines.push('',`## File ${i+1}`,`[Source file](${url(file.afterPresent===false?result.mergeBase:result.head,file.path,1,file.exact!==false)})`);
   if(file.status!=='compared'){lines.push('',`**Manual review required:** ${file.reason}`);return;}
   lines.push('',`Coverage: ${file.report.coverage.status}.`);
   if(!file.report.findings.length)lines.push('No declared changes in compared fields.');
   for(const f of file.report.findings){
    const [why,action]=advice(f.code);
-   const before=file.beforePresent?`[Before L${f.evidence.before.line}](${url(result.mergeBase,file.path,f.evidence.before.line)})`:'Before: file absent (synthetic empty baseline)';
-   const after=file.afterPresent?`[After L${f.evidence.after.line}](${url(result.head,file.path,f.evidence.after.line)})`:'After: file removed (synthetic empty state)';
+   const before=file.beforePresent?`[Before L${f.evidence.before.line}](${url(result.mergeBase,file.path,f.evidence.before.line,file.exact!==false)})`:'Before: file absent (synthetic empty baseline)';
+   const after=file.afterPresent?`[After L${f.evidence.after.line}](${url(result.head,file.path,f.evidence.after.line,file.exact!==false)})`:'After: file removed (synthetic empty state)';
    lines.push('',`### ${f.severity.toUpperCase()} · ${f.code}`,`${before} → ${after}`,'',`Why review: ${why}`,'',`Action: ${action}`);
   }
  });
